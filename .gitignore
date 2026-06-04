@@ -1,0 +1,12 @@
+__pycache__/
+.ipynb_checkpoints/*
+*.png
+data/*/*
+!data/*/preprocess*
+*.pyc
+**/*.txt
+exp*.ipynb
+*.html
+*.ipynb
+*.pdf
+!requirements.txt
