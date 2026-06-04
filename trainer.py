@@ -1,5 +1,3 @@
-
-
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -283,3 +281,102 @@ class ERM(object):
             'preds': preds,
             'errors': errors,
         }
+
+
+@trainer_register.register
+class JTT(ERM):
+    """Just Train Twice (JTT) trainer.
+
+    Stage 1 trains an ordinary ERM model for a short time. Then we collect the
+    training samples that the stage-1 model misclassifies. Stage 2 reinitializes
+    the model and trains weighted ERM, where stage-1 error samples receive a
+    larger weight.
+
+    The implementation uses per-sample loss weights instead of a weighted
+    sampler. This is simpler and works with the stable sample ids exposed by
+    TensorLoader.
+    """
+
+    def _reset_model_and_optimizer(self, model_init='default'):
+        reset_parameters(self._model, model_init)
+        self._optimizer.state.clear()
+        self._optimizer.zero_grad()
+
+    @staticmethod
+    def _print_error_breakdown(stats, name):
+        errors = stats['errors'].astype(bool)
+        n = len(errors)
+        print(f'{name} error rate: {errors.mean():.6f} ({errors.sum()}/{n})')
+
+        for key in ['envs', 'groups', 'attrs']:
+            values = stats[key]
+            label = key[:-1] if key.endswith('s') else key
+            for value in sorted(np.unique(values).tolist()):
+                mask = values == value
+                err_cnt = int(errors[mask].sum())
+                total = int(mask.sum())
+                err_rate = err_cnt / total if total > 0 else float('nan')
+                print(f'{name} {label}={int(value)}: error_rate={err_rate:.6f}, errors={err_cnt}, total={total}')
+
+    def _build_jtt_weights(self, stats, up_weight, normalize=True):
+        n_train = len(self._dataset.training_dataset)
+        weights = np.ones(n_train, dtype=np.float32)
+        ids = stats['ids'].astype(np.int64)
+        error_ids = ids[stats['errors'].astype(bool)]
+        weights[error_ids] = float(up_weight)
+
+        if normalize:
+            mean_weight = float(weights.mean())
+            if mean_weight > 0:
+                weights = weights / mean_weight
+
+        # Print how many samples are effectively emphasized in each group. This
+        # is useful for the final report because it shows whether JTT is really
+        # focusing on minority / shortcut-conflicting groups.
+        print(f'JTT up_weight={up_weight}, normalize={normalize}')
+        print(f'JTT raw emphasized samples: {len(error_ids)}/{n_train}')
+        for group_id in sorted(np.unique(stats['groups']).tolist()):
+            mask = stats['groups'] == group_id
+            ids_g = ids[mask]
+            err_g = stats['errors'][mask].astype(bool)
+            print(
+                f'JTT group={int(group_id)}: '
+                f'count={int(mask.sum())}, errors={int(err_g.sum())}, '
+                f'mean_weight={float(weights[ids_g].mean()):.6f}'
+            )
+        return torch.tensor(weights, dtype=torch.float32)
+
+    def train(self, num_training_updates, logging_steps, eval_steps, metrics=None, start_step=0, **kwargs):
+        if metrics is None:
+            metrics = []
+
+        stage1_steps = int(kwargs.get('jtt_stage1_steps', 100))
+        up_weight = float(kwargs.get('jtt_up_weight', 20.0))
+        normalize_weights = bool(kwargs.get('jtt_normalize_weights', True))
+        model_init = kwargs.get('model_init', 'default')
+
+        if stage1_steps <= 0:
+            raise ValueError('JTT requires --jtt_stage1_steps > 0.')
+        if up_weight < 1:
+            raise ValueError('JTT expects --jtt_up_weight >= 1.')
+
+        print('=' * 80)
+        print(f'JTT Stage 1: ERM warm-up for {stage1_steps} updates')
+        print('=' * 80)
+        self._loss_fn.update_weight(None)
+        super().train(stage1_steps, logging_steps, eval_steps, metrics, start_step=0, **kwargs)
+
+        stats = self.get_training_sample_statistics()
+        self._print_error_breakdown(stats, name='JTT Stage 1')
+        sample_weights = self._build_jtt_weights(stats, up_weight=up_weight, normalize=normalize_weights)
+
+        print('=' * 80)
+        print(f'JTT Stage 2: reinitialize and train weighted ERM for {num_training_updates} updates')
+        print('=' * 80)
+        self._reset_model_and_optimizer(model_init=model_init)
+        self._loss_fn.update_weight(sample_weights)
+        super().train(num_training_updates, logging_steps, eval_steps, metrics, start_step=0, **kwargs)
+
+        # Evaluation metrics should be computed on the unweighted objective.
+        self._loss_fn.update_weight(None)
+        return None
