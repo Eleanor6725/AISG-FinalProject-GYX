@@ -695,5 +695,337 @@ class SNCJTT(NeutralizedSoftJTT):
         )
 
 
-# Friendly alias used in the final project report.
+
+
+@trainer_register.register
+class DSSNCJTT(SNCJTT):
+    """Difficulty-Stratified Shortcut-Neutralized Consistency JTT.
+
+    This is the more distinctive final method. It keeps the two-stage JTT
+    structure, but neutralizes the shortcut attribute inside label-conditioned
+    difficulty strata rather than only balancing the four global y-attr groups.
+
+    Stage-1 ERM gives a difficulty score d_i = loss_i / mean(loss). We split
+    samples into K difficulty bins. In each stratum (label y, difficulty bin b),
+    we balance the weighted mass of attr=0 and attr=1. The intuition is that a
+    model can still exploit shortcuts within easy/hard subsets even when the
+    global group masses look balanced.
+    """
+
+    method_name = 'DS-SNCJTT'
+
+    def _make_difficulty_bins(self, stats, n_bins=3, mode='conditional'):
+        """Assign stage-1 difficulty bins to training samples.
+
+        mode='global' uses global loss quantiles. This was the first DS-SNCJTT
+        implementation, but on ColoredMNIST it often creates strata such as
+        (y=0, easy) that contain only attr=0 and no attr=1, so shortcut
+        neutralization cannot be applied there.
+
+        mode='conditional' is the default fixed version. It splits samples into
+        equal-frequency bins *inside each (label, attr) cell*. Thus bin b means
+        approximately the same relative difficulty percentile within each
+        shortcut cell. This guarantees that, when enough samples exist, every
+        (label, bin) stratum has both attrs and can be neutralized.
+        """
+        n_train = len(self._dataset.training_dataset)
+        ids = self._validate_stage1_stats(stats, n_train)
+        losses = stats['losses'].astype(np.float32)
+        labels = stats['labels'].astype(np.int64)
+        attrs = stats['attrs'].astype(np.int64)
+        n_bins = int(n_bins)
+        mode = str(mode).lower()
+        if n_bins <= 0:
+            raise ValueError('DS-SNCJTT expects --ds_num_bins >= 1.')
+        if mode not in ['conditional', 'global']:
+            raise ValueError("DS-SNCJTT expects --ds_bin_mode to be 'conditional' or 'global'.")
+        if mode not in ['conditional', 'global']:
+            raise ValueError("--ds_bin_mode must be either 'conditional' or 'global'.")
+
+        bins_in_stats_order = np.zeros_like(losses, dtype=np.int64)
+        edges_for_print = []
+
+        if n_bins == 1:
+            pass
+        elif mode == 'global':
+            qs = np.linspace(0, 1, n_bins + 1)[1:-1]
+            edges = np.unique(np.quantile(losses, qs))
+            bins_in_stats_order = np.digitize(losses, edges, right=False).astype(np.int64)
+            edges_for_print.append(('global', [float(x) for x in edges]))
+        else:
+            # Relative-difficulty bins within each (y, attr) cell.
+            # Rank-based binning avoids empty bins caused by duplicate quantile edges.
+            for y in sorted(np.unique(labels).tolist()):
+                for a in sorted(np.unique(attrs).tolist()):
+                    mask = (labels == y) & (attrs == a)
+                    idx = np.where(mask)[0]
+                    m = len(idx)
+                    if m == 0:
+                        continue
+                    order = idx[np.argsort(losses[idx], kind='mergesort')]
+                    if m < n_bins:
+                        # Extremely small cells: create as many nonempty bins as possible.
+                        local_bins = np.arange(m, dtype=np.int64)
+                    else:
+                        local_bins = (np.arange(m) * n_bins // m).astype(np.int64)
+                        local_bins = np.minimum(local_bins, n_bins - 1)
+                    bins_in_stats_order[order] = local_bins
+
+                    # Print approximate loss ranges for interpretability.
+                    ranges = []
+                    for b in sorted(np.unique(local_bins).tolist()):
+                        local_idx = order[local_bins == b]
+                        ranges.append((int(b), float(losses[local_idx].min()), float(losses[local_idx].max()), int(len(local_idx))))
+                    edges_for_print.append((f'y={int(y)},attr={int(a)}', ranges))
+
+        bins_by_id = np.zeros(n_train, dtype=np.int64)
+        bins_by_id[ids] = bins_in_stats_order
+
+        print(
+            f'DS-SNCJTT difficulty binning: mode={mode}, requested_bins={n_bins}, '
+            f'actual_bins={int(bins_in_stats_order.max()) + 1}'
+        )
+        if mode == 'global' and len(edges_for_print) > 0:
+            print('DS-SNCJTT global difficulty bin edges:', edges_for_print[0][1])
+        elif mode == 'conditional':
+            print('DS-SNCJTT conditional binning: bins are relative difficulty quantiles within each (label, attr) cell.')
+            for name, ranges in edges_for_print:
+                compact = ', '.join([f'b{b}:n={n},[{lo:.4f},{hi:.4f}]' for b, lo, hi, n in ranges])
+                print(f'  {name}: {compact}')
+
+        for b in sorted(np.unique(bins_in_stats_order).tolist()):
+            mask = bins_in_stats_order == b
+            print(
+                f'DS-SNCJTT bin={int(b)}: count={int(mask.sum())}, '
+                f'loss_mean={float(losses[mask].mean()):.6f}, '
+                f'loss_min={float(losses[mask].min()):.6f}, '
+                f'loss_max={float(losses[mask].max()):.6f}'
+            )
+        return bins_by_id
+
+    def _print_label_difficulty_attr_table(self, stats, weights, bins_by_id, method_name='DS-SNCJTT'):
+        ids = stats['ids'].astype(np.int64)
+        labels = stats['labels'].astype(np.int64)
+        attrs = stats['attrs'].astype(np.int64)
+        bins = bins_by_id[ids].astype(np.int64)
+        print(f'{method_name} weighted label-difficulty-attr table:')
+        for y in sorted(np.unique(labels).tolist()):
+            for b in sorted(np.unique(bins).tolist()):
+                mask_yb = (labels == y) & (bins == b)
+                if mask_yb.sum() == 0:
+                    continue
+                denom = float(weights[ids[mask_yb]].sum())
+                parts = []
+                for a in [0, 1]:
+                    mask = mask_yb & (attrs == a)
+                    mass = float(weights[ids[mask]].sum()) if mask.sum() > 0 else 0.0
+                    pct = mass / denom if denom > 0 else float('nan')
+                    parts.append(f'attr={a}: mass={mass:.3f} ({pct:.3f}), count={int(mask.sum())}')
+                print(f'  y={int(y)}, bin={int(b)}: ' + ', '.join(parts))
+
+    def _neutralize_label_difficulty_attr_mass(self, stats, weights, bins_by_id, power=1.0, eps=1e-12):
+        ids = stats['ids'].astype(np.int64)
+        labels = stats['labels'].astype(np.int64)
+        attrs = stats['attrs'].astype(np.int64)
+        bins = bins_by_id[ids].astype(np.int64)
+        neutralized = weights.copy()
+        power = float(power)
+
+        print(f'DS-SNCJTT label-difficulty shortcut-neutralization power={power}')
+        for y in sorted(np.unique(labels).tolist()):
+            for b in sorted(np.unique(bins).tolist()):
+                base = (labels == y) & (bins == b)
+                if base.sum() == 0:
+                    continue
+                masses = {}
+                counts = {}
+                for a in [0, 1]:
+                    mask = base & (attrs == a)
+                    counts[a] = int(mask.sum())
+                    masses[a] = float(weights[ids[mask]].sum()) if counts[a] > 0 else 0.0
+
+                # We cannot synthesize a missing attr side. If either side is
+                # absent, leave this stratum unchanged and print a warning.
+                if counts[0] == 0 or counts[1] == 0:
+                    print(
+                        f'  y={int(y)}, bin={int(b)}: skip neutralization because one attr side is missing; '
+                        f'counts={counts}, masses={masses}'
+                    )
+                    continue
+
+                target = (masses[0] + masses[1]) / 2.0
+                factors = {a: (target / (masses[a] + eps)) ** power for a in [0, 1]}
+                for a in [0, 1]:
+                    mask = base & (attrs == a)
+                    neutralized[ids[mask]] *= factors[a]
+
+                print(
+                    f'  y={int(y)}, bin={int(b)}: masses={{0: {masses[0]:.3f}, 1: {masses[1]:.3f}}}, '
+                    f'target={target:.3f}, factors={{0: {factors[0]:.6f}, 1: {factors[1]:.6f}}}'
+                )
+        return neutralized
+
+    def _build_ds_snc_weights(self, stats, alpha=1.0, neutralize_power=1.0, n_bins=3, normalize=True, bin_mode='conditional'):
+        n_train = len(self._dataset.training_dataset)
+        ids = self._validate_stage1_stats(stats, n_train)
+        losses = stats['losses'].astype(np.float32)
+        mean_loss = float(losses.mean())
+        if mean_loss <= 0:
+            raise ValueError('Cannot build DS-SNCJTT weights because stage-1 mean loss is non-positive.')
+
+        weights = np.ones(n_train, dtype=np.float32)
+        weights[ids] = 1.0 + float(alpha) * (losses / mean_loss)
+        bins_by_id = self._make_difficulty_bins(stats, n_bins=n_bins, mode=bin_mode)
+
+        print(f'DS-SNCJTT alpha={alpha}, stage1_mean_loss={mean_loss:.6f}')
+        self._print_weight_breakdown(stats, self._normalize_weights(weights.copy(), normalize=True),
+                                     method_name='DS-SNCJTT before stratified neutralization')
+        self._print_label_difficulty_attr_table(
+            stats, self._normalize_weights(weights.copy(), normalize=True), bins_by_id,
+            method_name='DS-SNCJTT before stratified neutralization'
+        )
+
+        weights = self._neutralize_label_difficulty_attr_mass(
+            stats, weights, bins_by_id, power=neutralize_power
+        )
+        weights = self._normalize_weights(weights, normalize=normalize)
+
+        self._print_weight_breakdown(stats, weights, method_name='DS-SNCJTT')
+        self._print_label_difficulty_attr_table(stats, weights, bins_by_id, method_name='DS-SNCJTT')
+        return torch.tensor(weights, dtype=torch.float32), torch.tensor(bins_by_id, dtype=torch.long)
+
+    def _class_difficulty_conditional_attr_consistency(self, logits, labels, attrs, difficulty_bins):
+        """Attr consistency inside each (label, difficulty-bin) stratum.
+
+        Compared with SNCJTT's class-conditional consistency, this prevents the
+        model from using shortcut attributes differently on easy/medium/hard
+        examples. The penalty is batch-local and skipped for strata where one
+        attr side is absent in the current batch.
+        """
+        penalty = logits.new_tensor(0.0)
+        count = 0
+        for y in [0, 1]:
+            mask_y = labels == y
+            for b in difficulty_bins.unique():
+                mask_yb = mask_y & (difficulty_bins == b)
+                mask_a0 = mask_yb & (attrs == 0)
+                mask_a1 = mask_yb & (attrs == 1)
+                if mask_a0.sum() > 0 and mask_a1.sum() > 0:
+                    penalty = penalty + (logits[mask_a0].mean() - logits[mask_a1].mean()).pow(2)
+                    count += 1
+        if count > 0:
+            penalty = penalty / count
+        return penalty
+
+    def _train_weighted_with_ds_consistency(self, num_training_updates, logging_steps, eval_steps, metrics=None,
+                                            start_step=0, consistency_lambda=0.0, difficulty_bins_by_id=None,
+                                            **kwargs):
+        if metrics is None:
+            metrics = []
+        if difficulty_bins_by_id is None:
+            raise ValueError('DS-SNCJTT requires difficulty_bins_by_id for stratified consistency.')
+        difficulty_bins_by_id = difficulty_bins_by_id.to(self._device)
+
+        iterator = iter(cycle(self._dataset.training_loader))
+        for i in tqdm(range(start_step, start_step + num_training_updates), desc=f'{self.method_name} Stage2'):
+            self._model.train()
+            input_batch, label_batch, env_batch, group_batch, attr_batch, ids = unpack_batch(
+                next(iterator), device=self._device
+            )
+
+            predict = self._model(input_batch).squeeze()
+            base_loss = self._loss_fn(
+                predict, label_batch, env_batch,
+                group=group_batch, attr=attr_batch, ids=ids, reduction='mean'
+            )
+            batch_bins = difficulty_bins_by_id[ids]
+            consistency = self._class_difficulty_conditional_attr_consistency(
+                predict, label_batch, attr_batch, batch_bins
+            )
+            total_loss = base_loss + float(consistency_lambda) * consistency
+
+            self._optimizer.zero_grad()
+            total_loss.backward()
+            self._optimizer.step()
+
+            if eval_steps > 0 and (i + 1) % eval_steps == 0:
+                val_loss, metric_dict = self.evaluate(self._dataset.validation_loader, metrics)
+                print(f'train loss:{base_loss} ds_consistency:{consistency} val loss:{val_loss}')
+                print('Validation metrics:', metric_dict)
+
+            if logging_steps > 0 and (i + 1) % logging_steps == 0:
+                print(f'train loss:{base_loss} ds_consistency:{consistency} total_loss:{total_loss}')
+        return None
+
+    def _train_stage2_ds(self, num_training_updates, logging_steps, eval_steps, metrics, kwargs,
+                         sample_weights, difficulty_bins_by_id, consistency_lambda=0.0):
+        model_init = kwargs.get('model_init', 'default')
+        print('=' * 80)
+        print(f'{self.method_name} Stage 2: reinitialize and train DS-weighted ERM for {num_training_updates} updates')
+        if consistency_lambda > 0:
+            print(f'{self.method_name} Stage 2 uses difficulty-stratified attr consistency, lambda={consistency_lambda}')
+        print('=' * 80)
+
+        self._reset_model_and_optimizer(model_init=model_init)
+        self._loss_fn.update_weight(sample_weights)
+
+        if consistency_lambda > 0:
+            self._train_weighted_with_ds_consistency(
+                num_training_updates, logging_steps, eval_steps, metrics,
+                consistency_lambda=consistency_lambda,
+                difficulty_bins_by_id=difficulty_bins_by_id,
+                **kwargs
+            )
+        else:
+            ERM.train(self, num_training_updates, logging_steps, eval_steps, metrics, start_step=0, **kwargs)
+
+        self._loss_fn.update_weight(None)
+        return None
+
+    def train(self, num_training_updates, logging_steps, eval_steps, metrics=None, start_step=0, **kwargs):
+        if metrics is None:
+            metrics = []
+
+        stage1_steps = int(kwargs.get('jtt_stage1_steps', 100))
+        alpha = float(kwargs.get('softjtt_alpha', 1.0))
+        neutralize_power = float(kwargs.get('snc_neutralize_power', 1.0))
+        normalize_weights = bool(kwargs.get('jtt_normalize_weights', True))
+        consistency_lambda = float(kwargs.get('snc_consistency_lambda', 0.1))
+        n_bins = int(kwargs.get('ds_num_bins', 3))
+        bin_mode = str(kwargs.get('ds_bin_mode', 'conditional')).lower()
+
+        if stage1_steps <= 0:
+            raise ValueError('DS-SNCJTT requires --jtt_stage1_steps > 0.')
+        if alpha < 0:
+            raise ValueError('DS-SNCJTT expects --softjtt_alpha >= 0.')
+        if neutralize_power < 0:
+            raise ValueError('DS-SNCJTT expects --snc_neutralize_power >= 0.')
+        if consistency_lambda < 0:
+            raise ValueError('DS-SNCJTT expects --snc_consistency_lambda >= 0.')
+        if n_bins <= 0:
+            raise ValueError('DS-SNCJTT expects --ds_num_bins >= 1.')
+        if bin_mode not in ['conditional', 'global']:
+            raise ValueError("DS-SNCJTT expects --ds_bin_mode to be 'conditional' or 'global'.")
+
+        stats = self._run_stage1_and_collect_stats(stage1_steps, logging_steps, eval_steps, metrics, kwargs)
+        sample_weights, difficulty_bins_by_id = self._build_ds_snc_weights(
+            stats,
+            alpha=alpha,
+            neutralize_power=neutralize_power,
+            n_bins=n_bins,
+            normalize=normalize_weights,
+            bin_mode=bin_mode,
+        )
+        return self._train_stage2_ds(
+            num_training_updates, logging_steps, eval_steps, metrics, kwargs,
+            sample_weights=sample_weights,
+            difficulty_bins_by_id=difficulty_bins_by_id,
+            consistency_lambda=consistency_lambda,
+        )
+
+
+# Friendly aliases used in the final project report.
 trainer_register['Ours'] = SNCJTT
+trainer_register['DS-SNCJTT'] = DSSNCJTT
+trainer_register['DS_SNCJTT'] = DSSNCJTT
+trainer_register['OursDS'] = DSSNCJTT

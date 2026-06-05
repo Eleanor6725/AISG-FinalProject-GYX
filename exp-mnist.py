@@ -61,6 +61,10 @@ parser.add_argument('--snc_neutralize_power', default=1.0, type=float,
                     help='Power for group-mass neutralization. 1.0 means full neutralization, 0 disables it.')
 parser.add_argument('--snc_consistency_lambda', default=0.1, type=float,
                     help='Class-conditional attr consistency regularization strength for SNCJTT/Ours.')
+parser.add_argument('--ds_num_bins', default=3, type=int,
+                    help='Number of stage-1 loss difficulty bins for DS-SNCJTT.')
+parser.add_argument('--ds_bin_mode', default='conditional', choices=['conditional', 'global'], type=str,
+                    help='Difficulty binning mode for DS-SNCJTT. conditional=fixed relative bins within each (label, attr); global=old global loss bins.')
 parser.add_argument('--no_check_data', dest='check_data', action='store_false',
                     help='Disable dataset/group diagnostic output at the beginning of each run.')
 parser.set_defaults(jtt_normalize_weights=True, jtt_eval_stage1=True, check_data=True)
@@ -157,7 +161,7 @@ def run_exp():
             reg_object,
             **args.__dict__,
         )
-    elif args.trainer in ['JTT', 'SoftJTT', 'NeutralizedSoftJTT', 'SNCJTT', 'Ours']:
+    elif args.trainer in ['JTT', 'SoftJTT', 'NeutralizedSoftJTT', 'SNCJTT', 'Ours', 'DSSNCJTT', 'DS-SNCJTT', 'DS_SNCJTT', 'OursDS']:
         if reg_object is not None:
             print(f'Warning: {args.trainer} ignores --reg_name; it is implemented as two-stage weighted ERM.')
             reg_object = None
