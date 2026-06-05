@@ -53,7 +53,11 @@ parser.add_argument('--jtt_up_weight', default=20.0, type=float,
                     help='Relative weight assigned to samples misclassified by the JTT stage-1 model.')
 parser.add_argument('--jtt_no_normalize_weights', dest='jtt_normalize_weights', action='store_false',
                     help='Disable mean normalization of JTT sample weights.')
-parser.set_defaults(jtt_normalize_weights=True)
+parser.add_argument('--jtt_no_eval_stage1', dest='jtt_eval_stage1', action='store_false',
+                    help='Do not evaluate the JTT stage-1 ERM model before stage-2 training.')
+parser.add_argument('--no_check_data', dest='check_data', action='store_false',
+                    help='Disable dataset/group diagnostic output at the beginning of each run.')
+parser.set_defaults(jtt_normalize_weights=True, jtt_eval_stage1=True, check_data=True)
 
 args = parser.parse_args()
 print(args)
@@ -108,6 +112,8 @@ def run_exp():
     print('Loading Dataset')
     dataset = TensorLoader(batch_size=args.batch_size, path=args.dataset_path, split=args.split, workers=0)
     print(f'feature_dim={dataset.feature_dim}, n_envs={dataset.n_envs}, n_groups={dataset.n_groups}')
+    if args.check_data:
+        dataset.print_diagnostics()
 
     model = MLP(
         input_dim=dataset.feature_dim,

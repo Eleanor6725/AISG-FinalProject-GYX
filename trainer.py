@@ -322,9 +322,18 @@ class JTT(ERM):
         n_train = len(self._dataset.training_dataset)
         weights = np.ones(n_train, dtype=np.float32)
         ids = stats['ids'].astype(np.int64)
+
+        # Correctness checks for the JTT implementation. If these fail, sample
+        # weights could be assigned to the wrong training examples.
+        if ids.min() < 0 or ids.max() >= n_train:
+            raise ValueError('JTT sample ids are out of range; cannot build weights safely.')
+        if len(np.unique(ids)) != n_train:
+            raise ValueError('JTT expected one unique id for each training sample.')
+
         error_ids = ids[stats['errors'].astype(bool)]
         weights[error_ids] = float(up_weight)
 
+        raw_weights = weights.copy()
         if normalize:
             mean_weight = float(weights.mean())
             if mean_weight > 0:
@@ -335,14 +344,35 @@ class JTT(ERM):
         # focusing on minority / shortcut-conflicting groups.
         print(f'JTT up_weight={up_weight}, normalize={normalize}')
         print(f'JTT raw emphasized samples: {len(error_ids)}/{n_train}')
+        print(f'JTT raw weight mean={raw_weights.mean():.6f}, normalized weight mean={weights.mean():.6f}')
         for group_id in sorted(np.unique(stats['groups']).tolist()):
             mask = stats['groups'] == group_id
             ids_g = ids[mask]
             err_g = stats['errors'][mask].astype(bool)
+            mean_loss = float(stats['losses'][mask].mean()) if mask.sum() > 0 else float('nan')
             print(
                 f'JTT group={int(group_id)}: '
                 f'count={int(mask.sum())}, errors={int(err_g.sum())}, '
+                f'error_rate={float(err_g.mean()):.6f}, '
+                f'mean_stage1_loss={mean_loss:.6f}, '
                 f'mean_weight={float(weights[ids_g].mean()):.6f}'
+            )
+
+        # Shortcut-direction diagnostic. For ColoredMNIST attr==y corresponds to
+        # the training shortcut, while attr!=y corresponds to the reversed shortcut.
+        labels = stats['labels'].astype(np.int64)
+        attrs = stats['attrs'].astype(np.int64)
+        shortcut_match = attrs == labels
+        for flag, name in [(True, 'attr==y'), (False, 'attr!=y')]:
+            mask = shortcut_match == flag
+            if mask.sum() == 0:
+                continue
+            err = stats['errors'][mask].astype(bool)
+            ids_s = ids[mask]
+            print(
+                f'JTT shortcut subset {name}: count={int(mask.sum())}, '
+                f'error_rate={float(err.mean()):.6f}, '
+                f'mean_weight={float(weights[ids_s].mean()):.6f}'
             )
         return torch.tensor(weights, dtype=torch.float32)
 
@@ -368,6 +398,21 @@ class JTT(ERM):
 
         stats = self.get_training_sample_statistics()
         self._print_error_breakdown(stats, name='JTT Stage 1')
+
+        # Optional but on by default: evaluate the stage-1 model before it is
+        # discarded. This lets us verify that JTT starts from an ordinary ERM
+        # model and makes the failure mode easy to diagnose.
+        if bool(kwargs.get('jtt_eval_stage1', True)):
+            print('=' * 80)
+            print('JTT Stage 1 validation/test diagnostics before reinitialization')
+            print('=' * 80)
+            val_loss, val_metrics = self.evaluate(self._dataset.validation_loader, metrics)
+            print('JTT Stage 1 validation loss:', val_loss)
+            print('JTT Stage 1 validation metrics:', val_metrics)
+            for split_name, loader in self._dataset.test_loader.items():
+                stage1_metrics = self.evaluate(loader, metrics, return_loss=False)
+                print(f'JTT Stage 1 {split_name} metrics:', stage1_metrics)
+
         sample_weights = self._build_jtt_weights(stats, up_weight=up_weight, normalize=normalize_weights)
 
         print('=' * 80)
