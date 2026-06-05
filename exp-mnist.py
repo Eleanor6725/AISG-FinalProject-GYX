@@ -55,6 +55,12 @@ parser.add_argument('--jtt_no_normalize_weights', dest='jtt_normalize_weights', 
                     help='Disable mean normalization of JTT sample weights.')
 parser.add_argument('--jtt_no_eval_stage1', dest='jtt_eval_stage1', action='store_false',
                     help='Do not evaluate the JTT stage-1 ERM model before stage-2 training.')
+parser.add_argument('--softjtt_alpha', default=1.0, type=float,
+                    help='SoftJTT difficulty weight strength: w_i = 1 + alpha * loss_i / mean_loss.')
+parser.add_argument('--snc_neutralize_power', default=1.0, type=float,
+                    help='Power for group-mass neutralization. 1.0 means full neutralization, 0 disables it.')
+parser.add_argument('--snc_consistency_lambda', default=0.1, type=float,
+                    help='Class-conditional attr consistency regularization strength for SNCJTT/Ours.')
 parser.add_argument('--no_check_data', dest='check_data', action='store_false',
                     help='Disable dataset/group diagnostic output at the beginning of each run.')
 parser.set_defaults(jtt_normalize_weights=True, jtt_eval_stage1=True, check_data=True)
@@ -151,11 +157,11 @@ def run_exp():
             reg_object,
             **args.__dict__,
         )
-    elif args.trainer == 'JTT':
+    elif args.trainer in ['JTT', 'SoftJTT', 'NeutralizedSoftJTT', 'SNCJTT', 'Ours']:
         if reg_object is not None:
-            print('Warning: JTT ignores --reg_name; it is implemented as two-stage weighted ERM.')
+            print(f'Warning: {args.trainer} ignores --reg_name; it is implemented as two-stage weighted ERM.')
             reg_object = None
-        trainer = trainer_register['JTT'](
+        trainer = trainer_register[args.trainer](
             device, model, optimizer, dataset, bce_loss(), reg_object, **args.__dict__
         )
     else:
